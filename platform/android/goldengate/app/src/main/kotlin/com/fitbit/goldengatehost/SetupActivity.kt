@@ -5,6 +5,8 @@ package com.fitbit.goldengatehost
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
@@ -16,6 +18,13 @@ import com.fitbit.goldengatehost.scan.EXTRA_SAVE_ONLY
 import com.fitbit.goldengatehost.scan.ScanActivity
 
 class SetupActivity : AppCompatActivity() {
+    private val statusHandler = Handler(Looper.getMainLooper())
+    private val statusRefresh = object : Runnable {
+        override fun run() {
+            refreshStatus()
+            statusHandler.postDelayed(this, STATUS_REFRESH_MILLIS)
+        }
+    }
     private lateinit var notificationRules: EditText
     private lateinit var notificationAccessButton: Button
     private lateinit var notificationAccessStatus: TextView
@@ -23,6 +32,8 @@ class SetupActivity : AppCompatActivity() {
     private lateinit var lastTaskStatus: TextView
     private lateinit var chooseDeviceButton: Button
     private lateinit var manualTestButton: Button
+    private lateinit var openGoogleHealthButton: Button
+    private lateinit var dncsProbeButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,19 +71,37 @@ class SetupActivity : AppCompatActivity() {
             )
             Toast.makeText(
                 this,
-                if (accepted) "已启动 single 按需连接测试" else "请先选择 Fitbit Air",
+                if (accepted) "已启动 single 测试；结束后可一键重开 Google Health" else "请先选择 Fitbit Air",
                 Toast.LENGTH_LONG
             ).show()
             refreshStatus()
+        }
+        openGoogleHealthButton.setOnClickListener {
+            val opened = GoogleHealthRecovery.open(this)
+            Toast.makeText(
+                this,
+                if (opened) "正在重开 Google Health 以刷新设备会话" else "未找到 Google Health",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+        dncsProbeButton.setOnClickListener {
+            startActivity(Intent(this, AirDncsProbeActivity::class.java))
         }
     }
 
     override fun onResume() {
         super.onResume()
         refreshStatus()
+        statusHandler.removeCallbacks(statusRefresh)
+        statusHandler.postDelayed(statusRefresh, STATUS_REFRESH_MILLIS)
         if (!AirBluetoothPermissions.hasAll(this)) {
             AirBluetoothPermissions.request(this, REQ_ID)
         }
+    }
+
+    override fun onPause() {
+        statusHandler.removeCallbacks(statusRefresh)
+        super.onPause()
     }
 
     private fun bindViews() {
@@ -83,6 +112,8 @@ class SetupActivity : AppCompatActivity() {
         lastTaskStatus = ActivityCompat.requireViewById(this, R.id.last_task_status)
         chooseDeviceButton = ActivityCompat.requireViewById(this, R.id.start_button)
         manualTestButton = ActivityCompat.requireViewById(this, R.id.manual_test_button)
+        openGoogleHealthButton = ActivityCompat.requireViewById(this, R.id.open_google_health_button)
+        dncsProbeButton = ActivityCompat.requireViewById(this, R.id.dncs_probe_button)
     }
 
     private fun saveRules(): Boolean {
@@ -108,5 +139,9 @@ class SetupActivity : AppCompatActivity() {
         selectedDeviceStatus.text = "目标设备：${AirBridgeDeviceSettings.loadDeviceLabel(this)}"
         lastTaskStatus.text = "最近任务：${AirBridgeDeviceSettings.loadLastStatus(this)}"
         manualTestButton.isEnabled = AirBridgeDeviceSettings.loadAddress(this) != null
+    }
+
+    companion object {
+        private const val STATUS_REFRESH_MILLIS = 500L
     }
 }

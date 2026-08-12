@@ -51,11 +51,11 @@ One pattern group is one complete toggle/restore primitive. Multiple groups are 
 
 Actual perceived timing also includes BLE/CoAP response latency. Patterns therefore require device testing and are not real-time waveforms.
 
-## Connection ownership and v10014 time-sharing
+## Connection ownership and failed v10014 time-sharing assumption
 
 Interoperability testing indicates that Fitbit Air accepts only one active Gattlink/DTLS owner. A persistent bridge connection therefore prevents Google Health from connecting, and vice versa.
 
-v10014 changes the notification path to:
+v10014 attempted this notification path:
 
 ```text
 notification listener (disconnected)
@@ -67,4 +67,135 @@ notification listener (disconnected)
   -> stop the foreground task
 ```
 
-The task makes at most three attempts. The scan and connection timeouts deliberately bound how long the bridge competes with Google Health. This time-sharing behavior is pending device validation.
+Device validation disproved the assumption behind this design. Closing the
+Google Health activity does not stop its companion-device background service.
+Google Health keeps the Air link, the Air does not advertise for the bridge,
+and all three bounded attempts can expire before a pattern is executed.
+
+The Android BLE API does not expose another application's `BluetoothGatt` or
+Golden Gate/DTLS session, so a normal third-party APK cannot directly reuse the
+connection owned by Google Health.
+
+## DNCS coexistence probe (v10015)
+
+The Google Health APK declares a phone-side Fitbit Device Notification Center
+Service (DNCS) GATT server. It uses these UUIDs:
+
+| Attribute | UUID |
+|---|---|
+| Service | `16bcfd00-253f-c348-e831-0db3e334d580` |
+| Control Point | `16bcfd01-253f-c348-e831-0db3e334d580` |
+| Notification Source | `16bcfd02-253f-c348-e831-0db3e334d580` |
+| Data Source | `16bcfd03-253f-c348-e831-0db3e334d580` |
+| Location Status | `16bcfd04-253f-c348-e831-0db3e334d580` |
+
+The Notification Source record is eight bytes:
+
+```text
+event(1), flags(1), category(1), categoryCount(1), uidLE(4)
+```
+
+v10015 adds a diagnostic local GATT server using this layout. It does not scan
+for, connect to, disconnect from, or change settings on Air. It records whether
+an Air already connected by Google Health discovers or subscribes to the second
+DNCS service instance. A test notification can only be sent after a real CCCD
+subscription is observed.
+
+This is an experiment, not a claimed notification transport. The decisive
+device result is whether Air produces DNCS read/write/CCCD callbacks while
+Google Health remains connected.
+
+Initial v10015 device testing confirmed that the probe receives a GATT Server
+`CONNECTED` callback for the same Air link owned by Google Health and that the
+duplicate DNCS service is accepted with status 0. No CCCD callback was visible
+in the first second after registration. v10016 therefore adds a manual,
+one-time `BluetoothGattServer.cancelConnection` test: the probe keeps its DNCS
+service registered while Google Health reconnects Air, allowing service
+discovery to begin with both server instances already present.
+
+The v10016 one-time cancellation produced no disconnect callback and the
+system still listed Air under both GATT client and GATT server profiles. This
+shows that cancellation from the probe does not tear down the physical link
+owned by Google Health. v10017 therefore tests two remaining questions: whether
+Android will send a Notification Source value on the shared server link before
+a CCCD callback, and whether Air subscribes when Bluetooth is restarted and the
+probe re-registers DNCS during the initial reconnection/service discovery.
+
+The complete v10017 device run answered both questions negatively. Air made no
+DNCS read, write, or CCCD request before or after a full Bluetooth restart.
+Android accepted two unsubscribed Notification Source sends and reported
+`onNotificationSent status=0`, but Air did not vibrate. Those callbacks prove
+only local ATT transport completion; they are not evidence that Air consumed
+the record. DNCS is therefore rejected as the bridge transport for this device.
+
+## Known-address dual-client probe (v10018)
+
+v10018 removes the advertising precondition from the one-shot path. It imports
+the saved Air address from Android's connected GATT-device list when available,
+or registers that address directly with BitGatt, and then attempts the normal
+Gattlink/BOOTSTRAP-DTLS setup without a BLE scan.
+
+This does not reuse Google Health's `BluetoothGatt` object or DTLS session. It
+creates a second app GATT client over whatever physical BLE link Android can
+provide. The decisive device checks are: whether Gattlink/DTLS reaches session,
+whether the short haptic executes, and whether Google Health can still perform
+a real Air read/sync after the bridge releases its own client. Until all three
+are observed, this remains a coexistence probe rather than a supported mode.
+
+The v10018 device result showed that the second client could establish DTLS and
+execute the haptic. After the bridge closed only its own GATT client, however,
+Google Health could no longer sync and displayed error 3000. The Android system
+link surviving is therefore not a valid handoff signal: Air's active protocol
+session had changed while Google Health retained stale connection state.
+
+## Explicit physical-link handoff (v10019)
+
+v10019 treats simultaneous DTLS ownership as disproved. After executing and
+verifying the haptic, it first publishes Link Configuration's disconnect request
+to Air, falling back to the General Purpose Disconnect command. Only after that
+request completes or times out does it close the bridge peer. It then polls the
+system GATT profile for an actual disconnect/reconnect cycle.
+
+The decisive result is not merely a final `CONNECTED` snapshot. The app must
+report `sawDisconnect=true`, and Google Health must subsequently complete a real
+manual sync. If Air is not subscribed to this app's duplicate Link Configuration
+service, the handoff will report `UNAVAILABLE`; a stock app has no public Android
+API that can force another app's GATT client to renegotiate DTLS.
+
+The device result was `PREFERRED_CONFIG_DISCONNECT` with
+`systemGatt(before/after)=true/true` and `sawDisconnect=false`. Google Health
+still returned error 3000 until its UI was normally closed and reopened. The
+command completion was therefore only evidence that this client finished the
+request; it was not evidence of a tracker-originated physical disconnect or a
+successful ownership handoff.
+
+## User-authorized Health task refresh (v10020)
+
+v10020 removes the disproved disconnect claim. After a verified haptic it closes
+the bridge peer, then offers a button and a non-ongoing notification action that
+starts Google Health's public launcher with a cleared Activity task. This is a
+visible user action, not a background sync API, process force-stop, or privilege
+escalation. Device testing must still establish whether the new Activity
+lifecycle is enough to discard the stale protocol session and complete a real
+sync without error 3000.
+
+The same build preserves every failed connection attempt instead of replacing
+the first error with the eventual success. Failures are labelled at
+`RUNTIME_INIT`, `GATT_PREPARE`, `Gattlink/DTLS`, or `HAPTIC`. The known-device
+import settle window is also increased from 500 ms to 1500 ms. Those results
+distinguish a local client-initialization race from a DTLS ownership transition.
+
+### v10020 device result
+
+The first attempt reported `systemGatt=true`, `localGatt=true`,
+`source=SYSTEM_IMPORT`, and then timed out after 18 seconds at
+`Gattlink/DTLS`. The second attempt succeeded after a two-second retry delay and
+executed one verified haptic group. This rules out the known-device import wait
+as the primary cause and supports the single-session takeover interpretation.
+
+Afterward, the v10020 recovery action cleared and relaunched Google Health's
+Activity task, but a real sync still returned error 3000. UI lifecycle restart
+is therefore insufficient; the stale protocol state survives in Google
+Health's longer-lived background process. Privilege-assisted force-stop and
+manual ownership switching have both been rejected as product workflows. See
+`docs/OPEN_PROBLEMS.md` for the current blocker and exit criteria.

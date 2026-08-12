@@ -27,7 +27,14 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="v10014 按需连接：收到通知后才连接 Air，执行 pattern 并复核，然后立即断开，把设备归还给 Google Health。" />
+                android:text="v10020：记录每次尝试的真实失败阶段；震动后释放 Bridge，并提供一键重开 Google Health 来刷新旧 Gattlink/DTLS 会话。" />
+
+            <Button
+                android:id="@+id/dncs_probe_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="打开 DNCS 排除性探针（已证实不震动）" />
 
             <TextView
                 android:id="@+id/selected_device_status"
@@ -44,7 +51,14 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="按需连接并测试 single pattern" />
+                android:text="测试 SINGLE（记录首次失败详情）" />
+
+            <Button
+                android:id="@+id/open_google_health_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="重开 Google Health 恢复同步" />
 
             <TextView
                 android:id="@+id/last_task_status"
@@ -104,7 +118,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="16dp"
-                android:text="若 Google Health 正在同步，Bridge 会等待并重试。通知到震动可能有数秒延迟。" />
+                android:text="v10019 已证实 Link Controller 断链请求虽然返回完成，但 Air 没有发生真实物理断链（sawDisconnect=false）。普通 APK 无法直接销毁 Google Health 进程里的旧会话；v10020 的恢复动作会清空其现有 Activity task 并重新启动入口，但不会强行停止 Google Health 进程。" />
         </LinearLayout>
     </ScrollView>
 

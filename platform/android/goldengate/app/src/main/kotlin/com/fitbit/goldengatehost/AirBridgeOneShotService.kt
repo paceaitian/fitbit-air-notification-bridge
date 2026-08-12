@@ -6,14 +6,10 @@ import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
@@ -42,12 +38,11 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Owns the Air connection only for one queued notification task:
- * scan -> connect -> DTLS -> haptic pattern -> verify -> disconnect.
+ * join the known system link -> Gattlink/DTLS -> haptic pattern -> verify -> disconnect our client.
  */
 class AirBridgeOneShotService : Service() {
     private val queue = ArrayDeque<AirNotificationTrigger>()
     private val disposables = CompositeDisposable()
-    private val mainHandler = Handler(Looper.getMainLooper())
     private var processing = false
     private var activePeer: StackPeer<CoapEndpoint>? = null
     private var wakeLock: PowerManager.WakeLock? = null
@@ -94,14 +89,25 @@ class AirBridgeOneShotService : Service() {
         processing = true
         updateStatus("准备连接 Air：${trigger.sourcePackage} / ${trigger.pattern.wireName}")
         disposables.add(
-            executeWithRetry(trigger, 0)
+            executeWithRetry(trigger, 0, emptyList())
                 .subscribeOn(Schedulers.io())
                 .observeOn(AndroidSchedulers.mainThread())
                 .subscribe(
                     { result ->
-                        val status = "成功：${trigger.sourcePackage} / ${trigger.pattern.wireName}，" +
-                            "${result.groups.size} 组，强度已恢复为 " +
-                            AirDirectSettingsProtocol.hapticsIntensityName(result.finalIntensity)
+                        postHealthRecoveryNotification(trigger)
+                        val attemptSummary = if (result.failures.isEmpty()) {
+                            "首次成功"
+                        } else {
+                            "第 ${result.failures.size + 1} 次成功；前序=" +
+                                result.failures.joinToString(" | ")
+                        }
+                        val status = "震动成功：${trigger.sourcePackage} / ${trigger.pattern.wireName}，" +
+                            "${result.haptic.groups.size} 组，强度已恢复为 " +
+                            AirDirectSettingsProtocol.hapticsIntensityName(result.haptic.finalIntensity) +
+                            "；Bridge client 已释放；systemGatt(before/after)=" +
+                            "${result.before.systemGattConnectedBefore}/" +
+                            "${result.release.systemGattConnectedAfter}；$attemptSummary；" +
+                            "请点击“重开 Google Health”刷新旧协议会话"
                         updateStatus(status)
                         processing = false
                         processNext()
@@ -120,116 +126,163 @@ class AirBridgeOneShotService : Service() {
 
     private fun executeWithRetry(
         trigger: AirNotificationTrigger,
-        attemptIndex: Int
-    ): Single<AirHapticExecutionResult> = executeOnce(trigger)
+        attemptIndex: Int,
+        failures: List<String>
+    ): Single<DirectAirExecutionResult> = executeOnce(trigger)
+        .map { result ->
+            DirectAirExecutionResult(
+                haptic = result.haptic,
+                before = result.before,
+                release = result.release,
+                failures = failures
+            )
+        }
         .onErrorResumeNext { throwable ->
             releasePeer()
+            val failure = "#${attemptIndex + 1} " +
+                "${throwable.javaClass.simpleName}: ${throwable.message ?: "unknown"}"
+            val updatedFailures = failures + failure
             if (attemptIndex >= RETRY_DELAYS_MILLIS.size) {
-                Single.error(throwable)
+                Single.error(
+                    IllegalStateException(
+                        "共 ${attemptIndex + 1} 次失败；${updatedFailures.joinToString(" | ")}",
+                        throwable
+                    )
+                )
             } else {
                 val delay = RETRY_DELAYS_MILLIS[attemptIndex]
                 updateStatus(
-                    "Air 暂不可用，${delay / 1000}s 后进行第 ${attemptIndex + 2} 次尝试；" +
-                        "Google Health 可能正在同步"
+                    "$failure；${delay}ms 后进行第 ${attemptIndex + 2} 次尝试"
                 )
                 Single.timer(delay, TimeUnit.MILLISECONDS)
-                    .flatMap { executeWithRetry(trigger, attemptIndex + 1) }
+                    .flatMap { executeWithRetry(trigger, attemptIndex + 1, updatedFailures) }
             }
         }
 
-    private fun executeOnce(trigger: AirNotificationTrigger): Single<AirHapticExecutionResult> {
+    private fun executeOnce(trigger: AirNotificationTrigger): Single<DirectAirExecutionResult> {
         val address = AirBridgeDeviceSettings.loadAddress(this)
             ?: return Single.error(IllegalStateException("尚未选择 Fitbit Air"))
         return Single.fromCallable {
             AirBridgeRuntime.ensureInitialized(this)
             address
-        }.flatMap { scanForDevice(it) }
-            .flatMap { connection -> connectStack(connection.device.address) }
-            .flatMap { endpoint ->
+        }.onErrorResumeNext { error -> stageError("RUNTIME_INIT", error) }
+            .flatMap { savedAddress ->
+                prepareKnownDevice(savedAddress)
+                    .onErrorResumeNext { error -> stageError("GATT_PREPARE", error) }
+            }
+            .flatMap { prepared ->
+                connectStack(prepared)
+                    .map { endpoint -> prepared to endpoint }
+            }
+            .flatMap { (prepared, endpoint) ->
                 updateStatus("已建立 DTLS，正在执行 ${trigger.pattern.wireName}")
                 AirHapticPatternExecutor.execute(endpoint, trigger.pattern)
+                    .onErrorResumeNext { error -> stageError("HAPTIC", error) }
+                    .map { result -> prepared to result }
             }
-            .flatMap { result ->
-                releasePeer()
-                Single.timer(RELEASE_SETTLE_MILLIS, TimeUnit.MILLISECONDS).map { result }
+            .flatMap { (prepared, result) ->
+                updateStatus("震动完成，正在释放 Bridge client；Google Health 旧会话需重新打开刷新")
+                releaseBridgeClient(prepared)
+                    .map { release ->
+                        DirectAirExecutionResult(
+                            haptic = result,
+                            before = prepared,
+                            release = release,
+                            failures = emptyList()
+                        )
+                }
             }
             .doOnError { releasePeer() }
     }
 
-    private fun scanForDevice(address: String): Single<GattConnection> = Single.create { emitter ->
-        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        val adapter: BluetoothAdapter = manager.adapter
-            ?: run {
-                emitter.onError(IllegalStateException("Bluetooth adapter unavailable"))
-                return@create
-            }
-        if (!adapter.isEnabled) {
-            emitter.onError(IllegalStateException("Bluetooth is disabled"))
-            return@create
-        }
-        val scanner = adapter.bluetoothLeScanner
-            ?: run {
-                emitter.onError(IllegalStateException("BLE scanner unavailable"))
-                return@create
-            }
-        lateinit var callback: ScanCallback
-        val stopScan = {
-            mainHandler.removeCallbacksAndMessages(callback)
-            runCatching { scanner.stopScan(callback) }
-        }
-        callback = object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-                if (!result.device.address.equals(address, ignoreCase = true)) return
-                stopScan()
-                if (!emitter.isDisposed) {
-                    runCatching { registerScannedDevice(result) }
-                        .onSuccess(emitter::onSuccess)
-                        .onFailure(emitter::onError)
-                }
-            }
+    private fun <T> stageError(stage: String, error: Throwable): Single<T> = Single.error(
+        IllegalStateException(
+            "阶段=$stage；${error.javaClass.simpleName}: ${error.message ?: "unknown"}",
+            error
+        )
+    )
 
-            override fun onScanFailed(errorCode: Int) {
-                stopScan()
-                if (!emitter.isDisposed) emitter.onError(IllegalStateException("BLE scan failed: $errorCode"))
-            }
-        }
-        val timeout = Runnable {
-            stopScan()
-            if (!emitter.isDisposed) {
-                emitter.onError(IllegalStateException("Air not advertising (timeout)"))
-            }
-        }
-        emitter.setCancellable {
-            mainHandler.removeCallbacks(timeout)
-            stopScan()
-        }
-        try {
-            scanner.startScan(
-                listOf(ScanFilter.Builder().setDeviceAddress(address).build()),
-                ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(),
-                callback
-            )
-            mainHandler.postDelayed(timeout, SCAN_TIMEOUT_MILLIS)
-        } catch (throwable: Throwable) {
-            stopScan()
-            if (!emitter.isDisposed) emitter.onError(throwable)
-        }
+    /**
+     * Only our local StackPeer can be released from an ordinary app. v10019 proved that the
+     * Link Controller disconnect request completed locally but Air never left the system GATT
+     * link (sawDisconnect=false), so it must not be reported as a successful Health handoff.
+     */
+    private fun releaseBridgeClient(prepared: PreparedAirGatt): Single<AirReleaseResult> {
+        val address = prepared.connection.device.address
+        releasePeer()
+        return Single.timer(BRIDGE_RELEASE_SETTLE_MILLIS, TimeUnit.MILLISECONDS)
+            .map { AirReleaseResult(isSystemGattConnected(address)) }
     }
 
-    private fun registerScannedDevice(result: ScanResult): GattConnection {
+    /**
+     * Register the saved Bluetooth address with BitGatt without scanning. Android can expose a
+     * device already connected on the system GATT profile even when the peripheral is not
+     * advertising. BitGatt's own connected-device import is asynchronous, so give it a short
+     * bounded window before creating the local connection record ourselves.
+     */
+    private fun prepareKnownDevice(address: String): Single<PreparedAirGatt> = Single.defer {
+        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val adapter: BluetoothAdapter = manager.adapter
+            ?: return@defer Single.error(IllegalStateException("Bluetooth adapter unavailable"))
+        if (!adapter.isEnabled) {
+            return@defer Single.error(IllegalStateException("Bluetooth is disabled"))
+        }
+        val systemConnectedBefore = isSystemGattConnected(address)
         val fitbitGatt = FitbitGatt.getInstance()
-        fitbitGatt.addBackgroundScannedDeviceConnection(result)
-        fitbitGatt.getMatchingConnectionsForDeviceNames(null)
-            .firstOrNull { it.device.address.equals(result.device.address, ignoreCase = true) }
-            ?.let { return it }
-        val wrappedDevice = FitbitBluetoothDevice(result.device)
-        return GattConnection(wrappedDevice, Looper.getMainLooper()).also {
-            fitbitGatt.putConnectionIntoDevices(wrappedDevice, it)
+        fitbitGatt.addConnectedDevices()
+        updateStatus(
+            "不扫描：按已保存地址加入 GATT；systemGatt=" +
+                if (systemConnectedBefore) "CONNECTED" else "NOT_CONNECTED"
+        )
+        Single.timer(KNOWN_DEVICE_IMPORT_SETTLE_MILLIS, TimeUnit.MILLISECONDS)
+            .map {
+                val existing = fitbitGatt.getMatchingConnectionsForDeviceNames(null)
+                    .firstOrNull { it.device.address.equals(address, ignoreCase = true) }
+                val connection = existing ?: run {
+                    val wrappedDevice = FitbitBluetoothDevice(adapter.getRemoteDevice(address))
+                    GattConnection(wrappedDevice, Looper.getMainLooper()).also {
+                        fitbitGatt.putConnectionIntoDevices(wrappedDevice, it)
+                    }
+                }
+                PreparedAirGatt(
+                    connection = connection,
+                    systemGattConnectedBefore = systemConnectedBefore,
+                    localGattConnectedBefore = connection.isConnected,
+                    registration = if (existing == null) "KNOWN_ADDRESS" else "SYSTEM_IMPORT"
+                )
+            }
+    }
+
+    private fun isSystemGattConnected(address: String): Boolean {
+        val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        return runCatching {
+            manager.getConnectedDevices(BluetoothProfile.GATT)
+                .any { it.address.equals(address, ignoreCase = true) }
+        }.getOrDefault(false)
+    }
+
+    private fun connectStack(prepared: PreparedAirGatt): Single<CoapEndpoint> {
+        val address = prepared.connection.device.address
+        updateStatus(
+            "正在建立 Gattlink / DTLS；systemGatt=" +
+                "${if (prepared.systemGattConnectedBefore) "CONNECTED" else "NOT_CONNECTED"}, " +
+                "localGatt=${if (prepared.localGattConnectedBefore) "CONNECTED" else "NEW"}, " +
+                "source=${prepared.registration}"
+        )
+        return connectStack(address).onErrorResumeNext { error ->
+            Single.error(
+                IllegalStateException(
+                    "阶段=Gattlink/DTLS；systemGatt=" +
+                        "${prepared.systemGattConnectedBefore}, localGatt=" +
+                        "${prepared.localGattConnectedBefore}, source=${prepared.registration}；" +
+                        "${error.javaClass.simpleName}: ${error.message ?: "unknown"}",
+                    error
+                )
+            )
         }
     }
 
     private fun connectStack(address: String): Single<CoapEndpoint> {
-        updateStatus("已发现 Air，正在建立 Gattlink / DTLS")
         DiagnosticTlsIdentityRecorder.clear()
         val stackConfig = DtlsSocketNetifGattlink(
             Inet4Address.getByName(DEFAULT_SERVER_ADDRESS) as Inet4Address,
@@ -298,6 +351,27 @@ class AirBridgeOneShotService : Service() {
         )
         .build()
 
+    private fun postHealthRecoveryNotification(trigger: AirNotificationTrigger) {
+        val healthIntent = GoogleHealthRecovery.pendingIntent(this) ?: return
+        val message = "Air 已震动；点击重开 Google Health，恢复设备同步"
+        val notification = NotificationCompat.Builder(this, RECOVERY_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.jiji)
+            .setContentTitle("Google Health 会话需要刷新")
+            .setContentText(message)
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    "$message\n来源：${trigger.sourcePackage} / ${trigger.pattern.wireName}"
+                )
+            )
+            .setContentIntent(healthIntent)
+            .addAction(R.mipmap.jiji, "重开 Google Health", healthIntent)
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .build()
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(RECOVERY_NOTIFICATION_ID, notification)
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -308,6 +382,13 @@ class AirBridgeOneShotService : Service() {
                     NotificationManager.IMPORTANCE_LOW
                 )
             )
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    RECOVERY_CHANNEL_ID,
+                    "Google Health 同步恢复",
+                    NotificationManager.IMPORTANCE_LOW
+                )
+            )
         }
     }
 
@@ -315,11 +396,13 @@ class AirBridgeOneShotService : Service() {
         private const val EXTRA_SOURCE_PACKAGE = "source_package"
         private const val EXTRA_PATTERN = "pattern"
         private const val CHANNEL_ID = "air_bridge_connection"
+        private const val RECOVERY_CHANNEL_ID = "google_health_recovery"
         private const val NOTIFICATION_ID = 14001
+        private const val RECOVERY_NOTIFICATION_ID = 14002
         private const val MAX_QUEUE_SIZE = 10
-        private const val SCAN_TIMEOUT_MILLIS = 7_000L
         private const val CONNECT_TIMEOUT_SECONDS = 18L
-        private const val RELEASE_SETTLE_MILLIS = 700L
+        private const val KNOWN_DEVICE_IMPORT_SETTLE_MILLIS = 1_500L
+        private const val BRIDGE_RELEASE_SETTLE_MILLIS = 700L
         private const val WAKE_LOCK_TIMEOUT_MILLIS = 120_000L
         private val RETRY_DELAYS_MILLIS = listOf(2_000L, 5_000L)
 
@@ -341,4 +424,22 @@ class AirBridgeOneShotService : Service() {
             }
         }
     }
+
+    private data class PreparedAirGatt(
+        val connection: GattConnection,
+        val systemGattConnectedBefore: Boolean,
+        val localGattConnectedBefore: Boolean,
+        val registration: String
+    )
+
+    private data class DirectAirExecutionResult(
+        val haptic: AirHapticExecutionResult,
+        val before: PreparedAirGatt,
+        val release: AirReleaseResult,
+        val failures: List<String>
+    )
+
+    private data class AirReleaseResult(
+        val systemGattConnectedAfter: Boolean
+    )
 }
